@@ -18,6 +18,12 @@ dl-success = 下载完成
 guest = 游客
 
 warn-unrated = 本次游玩不计成绩
+custom-judgement-notice = 已启用 CUSTOM P/G/B { $perfect }/{ $good }/{ $bad }ms，本局成绩仅保存到本地且绝不会上传。
+multiplayer-default-judgement = 多人游戏使用原版 80/160/220ms 判定。
+custom-active-chip = CUSTOM · P/G/B { $perfect }/{ $good }/{ $bad } · 仅本地
+custom-best-source = 自定义最佳 · 达成于 { $perfect }/{ $good }/{ $bad }ms
+custom-best-empty = 自定义最佳 · 暂无记录
+custom-local-rank = 仅本地 · 可查看标准排行榜
 failed-to-play = 启动在线模式失败
 play-cancel = 取消
 play-switch-to-offline = 切换到离线模式

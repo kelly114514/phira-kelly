@@ -1,6 +1,11 @@
 prpr_l10n::tl_file!("ending");
 
-use super::{draw_background, game::SimpleRecord, loading::UploadFn, NextScene, Scene};
+use super::{
+    draw_background,
+    game::{PlayedRecord, SimpleRecord},
+    loading::UploadFn,
+    NextScene, Scene,
+};
 use crate::{
     config::{Config, Mods},
     core::{BOLD_FONT, PGR_FONT},
@@ -46,6 +51,7 @@ pub struct EndingScene {
     use_keyboard: bool,
     speed: f32,
     mods: Mods,
+    judgement_windows: Option<crate::config::JudgementWindows>,
     next: u8, // 0 -> none, 1 -> pop, 2 -> exit
     update_state: Option<RecordUpdateState>,
     rated: bool,
@@ -134,6 +140,7 @@ impl EndingScene {
             use_keyboard: config.use_keyboard,
             speed: config.speed,
             mods: config.mods,
+            judgement_windows: (!config.judgement_windows.is_default()).then_some(config.judgement_windows),
             next: 0,
 
             upload_fn,
@@ -543,7 +550,14 @@ impl Scene for EndingScene {
             } else {
                 format!("{:.2}x", self.speed)
             };
-            let status_text = if !self.rated && !self.autoplay && !self.use_keyboard {
+            let status_text = if let Some(windows) = self.judgement_windows {
+                tl!(
+                    "custom-local-status",
+                    "perfect" => windows.perfect_ms,
+                    "good" => windows.good_ms,
+                    "bad" => windows.bad_ms
+                )
+            } else if !self.rated && !self.autoplay && !self.use_keyboard {
                 if spd.is_empty() {
                     "UNRATED".to_string()
                 } else {
@@ -587,7 +601,11 @@ impl Scene for EndingScene {
                         .size(text_size);
                     let tr = text.measure_using(&BOLD_FONT);
                     let r = Rect::new(-1., tr.y, tr.right() + 1.03, tr.h);
-                    let mut b = text.ui.builder(WHITE);
+                    let mut b = text.ui.builder(if self.judgement_windows.is_some() {
+                        Color::from_hex_rgb(0xffb74d)
+                    } else {
+                        WHITE
+                    });
                     b.add(-1., tr.y);
                     b.add(r.right(), tr.y);
                     b.add(r.right() - tr.h * skew_height_ratio, tr.bottom());
@@ -687,7 +705,13 @@ impl Scene for EndingScene {
             1 => NextScene::Pop,
             2 => {
                 if let Some(rec) = &self.best_record {
-                    NextScene::PopNWithResult(2, Box::new(rec.clone()))
+                    NextScene::PopNWithResult(
+                        2,
+                        Box::new(PlayedRecord {
+                            record: rec.clone(),
+                            judgement_windows: self.judgement_windows,
+                        }),
+                    )
                 } else {
                     NextScene::PopN(2)
                 }

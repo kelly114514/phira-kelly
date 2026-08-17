@@ -329,6 +329,7 @@ pub async fn import_chart_to(dir: &Path, local_path: String, file: File) -> Resu
             info: info.into(),
             local_path,
             record: None,
+            custom_record: None,
             mods: Mods::default(),
             played_unlock: false,
         },

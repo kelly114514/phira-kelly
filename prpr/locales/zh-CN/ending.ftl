@@ -16,3 +16,4 @@ upload-cancel = 取消上传
 upload-retry = 重试
 
 still-uploading = 尚在上传成绩
+custom-local-status = CUSTOM · 仅本地 · P/G/B { $perfect }/{ $good }/{ $bad }ms

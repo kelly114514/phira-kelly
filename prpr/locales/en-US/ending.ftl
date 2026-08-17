@@ -16,3 +16,4 @@ upload-cancel = Cancel Upload
 upload-retry = Retry Upload
 
 still-uploading = Uploading record to leaderboard…
+custom-local-status = CUSTOM · LOCAL · P/G/B { $perfect }/{ $good }/{ $bad }ms

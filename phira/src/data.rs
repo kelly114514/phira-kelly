@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use prpr::{
-    config::{Config, Mods},
+    config::{Config, JudgementWindows, Mods},
     info::ChartInfo,
     scene::SimpleRecord,
     ui::PREFER_REDUCED_MOTION,
@@ -90,9 +90,33 @@ pub struct LocalChart {
     pub local_path: String,
     pub record: Option<SimpleRecord>,
     #[serde(default)]
+    pub custom_record: Option<CustomRecord>,
+    #[serde(default)]
     pub mods: Mods,
     #[serde(default)]
     pub played_unlock: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomRecord {
+    pub record: SimpleRecord,
+    pub judgement_windows: JudgementWindows,
+}
+
+impl CustomRecord {
+    pub fn is_better_record(record: &SimpleRecord, current: &SimpleRecord) -> bool {
+        record.is_better_lexicographic(current)
+    }
+
+    pub fn update(&mut self, record: SimpleRecord, judgement_windows: JudgementWindows) -> bool {
+        if !Self::is_better_record(&record, &self.record) {
+            return false;
+        }
+        self.record = record;
+        self.judgement_windows = judgement_windows;
+        true
+    }
 }
 
 fn default_anys_gateway() -> String {
@@ -105,6 +129,7 @@ pub struct Data {
     pub me: Option<User>,
     pub charts: Vec<LocalChart>,
     pub local_records: HashMap<String, Option<SimpleRecord>>,
+    pub custom_local_records: HashMap<String, CustomRecord>,
     pub config: Config,
     pub message_check_time: Option<DateTime<Utc>>,
     pub language: Option<String>,
@@ -222,6 +247,7 @@ impl Data {
                         info: BriefChartInfo { id: None, ..info.into() },
                         local_path: filename,
                         record: None,
+                        custom_record: None,
                         mods: Mods::default(),
                         played_unlock: false,
                     });
@@ -263,6 +289,7 @@ impl Data {
                         info: BriefChartInfo { id: Some(id), ..info.into() },
                         local_path: filename,
                         record: None,
+                        custom_record: None,
                         mods: Mods::default(),
                         played_unlock: false,
                     });
@@ -308,6 +335,8 @@ impl Data {
         let charts = dir::charts()?;
         self.local_records
             .retain(|local_path, _| Path::new(&format!("{charts}/{local_path}")).exists());
+        self.custom_local_records
+            .retain(|local_path, _| local_path.starts_with(':') || Path::new(&format!("{charts}/{local_path}")).exists());
 
         self.config.init();
         PREFER_REDUCED_MOTION.store(self.prefer_reduced_motion, Ordering::Relaxed);
@@ -376,5 +405,32 @@ impl Data {
             })
             .value()
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(score: i32, accuracy: f32, full_combo: bool) -> SimpleRecord {
+        SimpleRecord { score, accuracy, full_combo }
+    }
+
+    #[test]
+    fn custom_record_replaces_the_whole_result_lexicographically() {
+        let source = JudgementWindows::default();
+        let mut best = CustomRecord {
+            record: record(900_000, 0.95, false),
+            judgement_windows: source,
+        };
+        let new_windows = JudgementWindows {
+            perfect_ms: 100,
+            good_ms: 180,
+            bad_ms: 240,
+        };
+        assert!(best.update(record(900_001, 0.90, false), new_windows));
+        assert_eq!(best.record.accuracy, 0.90);
+        assert_eq!(best.judgement_windows, new_windows);
+        assert!(!best.update(record(900_000, 1.0, true), source));
     }
 }

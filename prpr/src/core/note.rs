@@ -140,11 +140,11 @@ impl Note {
 
     pub fn update(&mut self, res: &mut Resource, parent_rot: f32, parent_tr: &Matrix, ctrl_obj: &mut CtrlObject, line_height: f64) {
         self.object.set_time(res.time);
-        if let Some(color) = if let JudgeStatus::Hold(perfect, at, ..) = &mut self.judge {
+        if let Some(color) = if let JudgeStatus::Hold(grade, at, ..) = &mut self.judge {
             if res.time > *at {
                 *at += HOLD_PARTICLE_INTERVAL / res.config.speed as f64;
                 Some(self.fx_color.unwrap_or_else(|| {
-                    if *perfect {
+                    if matches!(grade, crate::judge::Judgement::Perfect) {
                         res.res_pack.info.fx_perfect()
                     } else {
                         res.res_pack.info.fx_good()

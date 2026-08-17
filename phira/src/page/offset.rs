@@ -7,10 +7,12 @@ use crate::{get_data, get_data_mut, save_data};
 use anyhow::{Context, Result};
 use macroquad::prelude::*;
 use prpr::{
+    config::{MAX_INPUT_OFFSET_MS, MIN_INPUT_OFFSET_MS},
     core::{ParticleEmitter, ResourcePack, NOTE_WIDTH_RATIO_BASE},
     ext::{create_audio_manger, semi_black, RectExt, SafeTexture, ScaleType},
+    judge::Judge,
     time::TimeManager,
-    ui::{Slider, Ui},
+    ui::{DRectButton, Slider, Ui},
 };
 use sasa::{AudioClip, AudioManager, Music, MusicParams, PlaySfxParams, Sfx};
 
@@ -28,6 +30,12 @@ pub struct OffsetPage {
     color: Color,
 
     slider: Slider,
+    input_slider: Slider,
+    apply_btn: DRectButton,
+    clear_btn: DRectButton,
+
+    input_samples: Vec<f64>,
+    dispatch_samples: Vec<f64>,
 
     touched: bool,
     touch: Option<(f32, f32)>,
@@ -35,6 +43,10 @@ pub struct OffsetPage {
 
 impl OffsetPage {
     const FADE_TIME: f32 = 0.8;
+    const MIN_INPUT_SAMPLES: usize = 30;
+    const MAX_INPUT_SAMPLES: usize = 60;
+    const MAX_SAMPLE_ERROR: f64 = 0.35;
+    const STABLE_MAD: f64 = 0.020;
 
     pub async fn new() -> Result<Self> {
         let mut audio = create_audio_manger(&get_data().config)?;
@@ -70,11 +82,67 @@ impl OffsetPage {
             color: respack.info.fx_perfect(),
 
             slider: Slider::new(-500.0..500.0, 5.),
+            input_slider: Slider::new(MIN_INPUT_OFFSET_MS as f32..MAX_INPUT_OFFSET_MS as f32, 1.),
+            apply_btn: DRectButton::new(),
+            clear_btn: DRectButton::new(),
+
+            input_samples: Vec::new(),
+            dispatch_samples: Vec::new(),
 
             touched: false,
             touch: None,
         })
     }
+
+    fn sample_stats(&self) -> Option<(f64, f64)> {
+        calibration_stats(&self.input_samples)
+    }
+
+    fn record_input_sample(&mut self, touch: &Touch, audio_offset: f32) {
+        let Some(age) = Judge::touch_event_age(touch) else {
+            return;
+        };
+        self.dispatch_samples.push(age);
+        if self.dispatch_samples.len() > Self::MAX_INPUT_SAMPLES {
+            self.dispatch_samples.remove(0);
+        }
+
+        // The existing audio/chart offset remains part of the expected beat.
+        // Input compensation is deliberately not applied here: calibration
+        // estimates the total residual correction from raw timestamped input.
+        let event_time = self.tm.now() - age;
+        let adjusted = event_time - audio_offset as f64;
+        let mut error = (adjusted - 1.).rem_euclid(2.);
+        if error > 1. {
+            error -= 2.;
+        }
+        if error.abs() <= Self::MAX_SAMPLE_ERROR {
+            self.input_samples.push(error);
+            if self.input_samples.len() > Self::MAX_INPUT_SAMPLES {
+                self.input_samples.remove(0);
+            }
+        }
+    }
+}
+
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut values = values.to_vec();
+    values.sort_by(|a, b| a.total_cmp(b));
+    let mid = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.
+    } else {
+        values[mid]
+    })
+}
+
+fn calibration_stats(samples: &[f64]) -> Option<(f64, f64)> {
+    let center = median(samples)?;
+    let deviations: Vec<_> = samples.iter().map(|value| (value - center).abs()).collect();
+    Some((center, median(&deviations).unwrap_or_default()))
 }
 
 impl Page for OffsetPage {
@@ -119,8 +187,33 @@ impl Page for OffsetPage {
             config.offset = offset / 1000.;
             return Ok(true);
         }
+        let mut input_offset = config.input_offset_ms as f32;
+        if self.input_slider.touch(touch, t, &mut input_offset).is_some() {
+            config.input_offset_ms = input_offset
+                .round()
+                .clamp(MIN_INPUT_OFFSET_MS as f32, MAX_INPUT_OFFSET_MS as f32) as i16;
+            return Ok(true);
+        }
+        if self.clear_btn.touch(touch, t) {
+            self.input_samples.clear();
+            self.dispatch_samples.clear();
+            return Ok(true);
+        }
+        if self.apply_btn.touch(touch, t) {
+            if self.input_samples.len() >= Self::MIN_INPUT_SAMPLES {
+                if let Some((center, mad)) = self.sample_stats() {
+                    if mad <= Self::STABLE_MAD {
+                        config.input_offset_ms = (center * 1000.)
+                            .round()
+                            .clamp(MIN_INPUT_OFFSET_MS as f64, MAX_INPUT_OFFSET_MS as f64) as i16;
+                    }
+                }
+            }
+            return Ok(true);
+        }
         if touch.phase == TouchPhase::Started && touch.position.x < 0. {
             self.touched = true;
+            self.record_input_sample(touch, config.offset);
         }
         Ok(false)
     }
@@ -202,12 +295,87 @@ impl Page for OffsetPage {
             }
 
             let offset = config.offset * 1000.;
+            ui.text(tl!("audio-offset"))
+                .pos(0.46, -0.22)
+                .size(0.42)
+                .color(semi_white(0.8))
+                .draw();
             self.slider
-                .render(ui, Rect::new(0.46, -0.1, 0.45, 0.2), ot, offset, format!("{offset:.0}ms"));
+                .render(ui, Rect::new(0.46, -0.16, 0.45, 0.16), ot, offset, format!("{offset:.0}ms"));
+
+            ui.text(tl!("input-offset"))
+                .pos(0.46, 0.08)
+                .size(0.42)
+                .color(semi_white(0.8))
+                .draw();
+            self.input_slider.render(
+                ui,
+                Rect::new(0.46, 0.14, 0.45, 0.16),
+                ot,
+                config.input_offset_ms as f32,
+                format!("{:+}ms", config.input_offset_ms),
+            );
+
+            let count = self.input_samples.len();
+            let dispatch_ms = median(&self.dispatch_samples).unwrap_or_default() * 1000.;
+            let (summary, ready) = if let Some((center, mad)) = self.sample_stats() {
+                let stable = count >= Self::MIN_INPUT_SAMPLES && mad <= Self::STABLE_MAD;
+                (
+                    tl!(
+                        "input-stats",
+                        "count" => count,
+                        "target" => Self::MIN_INPUT_SAMPLES,
+                        "median" => (center * 1000.).round() as i32,
+                        "mad" => (mad * 1000.).round() as i32,
+                        "dispatch" => dispatch_ms.round() as i32
+                    )
+                    .to_string(),
+                    stable,
+                )
+            } else {
+                (tl!("input-stats-empty", "target" => Self::MIN_INPUT_SAMPLES).to_string(), false)
+            };
+            ui.text(summary)
+                .pos(0.46, 0.37)
+                .size(0.34)
+                .multiline()
+                .max_width(0.45)
+                .color(semi_white(0.78))
+                .draw();
+            ui.text(if ready { tl!("input-stable") } else { tl!("input-tap-hint") })
+                .pos(0.46, 0.49)
+                .size(0.32)
+                .multiline()
+                .max_width(0.45)
+                .color(if ready { Color::from_hex_rgb(0x81c784) } else { semi_white(0.58) })
+                .draw();
+
+            let apply = Rect::new(0.46, 0.64, 0.27, 0.1);
+            let clear = Rect::new(0.75, 0.64, 0.16, 0.1);
+            if ready {
+                self.apply_btn.render_text(ui, apply, ot, tl!("input-apply"), 0.4, true);
+            } else {
+                self.apply_btn
+                    .render_text_color(ui, apply, ot, tl!("input-apply"), 0.4, false, semi_white(0.35));
+            }
+            self.clear_btn.render_text(ui, clear, ot, tl!("input-clear"), 0.4, false);
         });
 
         self.emitter.draw(get_frame_time());
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibration_uses_robust_median_and_mad() {
+        let samples = [0.020, 0.021, 0.019, 0.022, 0.300];
+        let (center, mad) = calibration_stats(&samples).unwrap();
+        assert!((center - 0.021).abs() < 1e-9);
+        assert!((mad - 0.002).abs() < 1e-9);
     }
 }

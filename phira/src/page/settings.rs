@@ -15,6 +15,7 @@ use inputbox::InputBox;
 use macroquad::prelude::*;
 use once_cell::sync::Lazy;
 use prpr::{
+    config::{JudgementWindows, MAX_JUDGEMENT_MS},
     core::BOLD_FONT,
     ext::{open_url, poll_future, semi_white, LocalTask, RectExt, SafeTexture},
     scene::{request_input, return_input, show_error, show_message, take_input},
@@ -273,8 +274,10 @@ impl Page for SettingsPage {
     }
 
     fn next_page(&mut self) -> NextPage {
-        if matches!(self.tabs.selected(), SettingListType::Audio) {
-            return self.list_audio.next_page().unwrap_or_default();
+        match self.tabs.selected() {
+            SettingListType::Audio => return self.list_audio.next_page().unwrap_or_default(),
+            SettingListType::Chart => return self.list_chart.next_page().unwrap_or_default(),
+            _ => {}
         }
         NextPage::None
     }
@@ -815,8 +818,10 @@ struct ChartList {
     dhint_btn: DRectButton,
     opt_btn: DRectButton,
     use_keyboard_btn: DRectButton,
+    judgement_btn: DRectButton,
     speed_slider: Slider,
     size_slider: Slider,
+    next_page: Option<NextPage>,
 }
 
 impl ChartList {
@@ -829,8 +834,10 @@ impl ChartList {
             dhint_btn: DRectButton::new(),
             opt_btn: DRectButton::new(),
             use_keyboard_btn: DRectButton::new(),
+            judgement_btn: DRectButton::new(),
             speed_slider: Slider::new(0.5..2., 0.05),
             size_slider: Slider::new(0.8..1.2, 0.005),
+            next_page: None,
         }
     }
 
@@ -868,6 +875,10 @@ impl ChartList {
         if self.use_keyboard_btn.touch(touch, t) {
             config.use_keyboard ^= true;
             return Ok(Some(true));
+        }
+        if self.judgement_btn.touch(touch, t) {
+            self.next_page = Some(NextPage::Overlay(Box::new(JudgementPage::new())));
+            return Ok(Some(false));
         }
         if let wt @ Some(_) = self.speed_slider.touch(touch, t, &mut config.speed) {
             return Ok(wt);
@@ -925,6 +936,21 @@ impl ChartList {
             render_switch(ui, rr, t, &mut self.use_keyboard_btn, config.use_keyboard);
         }
         item! {
+            render_title(ui, tl!("item-judgement-windows"), Some(tl!("item-judgement-windows-sub")));
+            let windows = config.judgement_windows;
+            let text = if windows.is_default() {
+                tl!("judgement-original-summary", "perfect" => windows.perfect_ms, "good" => windows.good_ms, "bad" => windows.bad_ms)
+            } else {
+                tl!("judgement-custom-summary", "perfect" => windows.perfect_ms, "good" => windows.good_ms, "bad" => windows.bad_ms)
+            };
+            if windows.is_default() {
+                self.judgement_btn.render_text(ui, rr, t, text, 0.38, false);
+            } else {
+                self.judgement_btn
+                    .render_text_color(ui, rr, t, text, 0.38, false, Color::from_hex_rgb(0xffb74d));
+            }
+        }
+        item! {
             render_title(ui, tl!("item-speed"), None);
             self.speed_slider.render(ui, rr, t, config.speed, format!("{:.2}", config.speed));
         }
@@ -933,6 +959,319 @@ impl ChartList {
             self.size_slider.render(ui, rr, t, config.note_scale, format!("{:.3}", config.note_scale));
         }
         (w, h)
+    }
+
+    pub fn next_page(&mut self) -> Option<NextPage> {
+        self.next_page.take()
+    }
+}
+
+struct JudgementPage {
+    perfect_slider: Slider,
+    good_slider: Slider,
+    bad_slider: Slider,
+    input_cali_btn: DRectButton,
+    reset_btn: DRectButton,
+    scroll: Scroll,
+    save_time: f32,
+    cali_task: LocalTask<Result<OffsetPage>>,
+    next_page: Option<NextPage>,
+}
+
+impl JudgementPage {
+    fn new() -> Self {
+        Self {
+            perfect_slider: Slider::new(0.0..MAX_JUDGEMENT_MS as f32, 5.),
+            good_slider: Slider::new(0.0..MAX_JUDGEMENT_MS as f32, 5.),
+            bad_slider: Slider::new(0.0..MAX_JUDGEMENT_MS as f32, 5.),
+            input_cali_btn: DRectButton::new(),
+            reset_btn: DRectButton::new(),
+            scroll: Scroll::new(),
+            save_time: f32::INFINITY,
+            cali_task: None,
+            next_page: None,
+        }
+    }
+
+    fn changed(&mut self, t: f32) {
+        let config = &mut get_data_mut().config;
+        config.judgement_window_notice_pending = !config.judgement_windows.is_default();
+        self.save_time = t;
+    }
+
+    fn touch_slider(slider: &mut Slider, touch: &Touch, t: f32, value: u16) -> (Option<bool>, u16) {
+        let mut value = value as f32;
+        let result = slider.touch(touch, t, &mut value);
+        (result, value.round().clamp(0., MAX_JUDGEMENT_MS as f32) as u16)
+    }
+}
+
+impl Page for JudgementPage {
+    fn label(&self) -> Cow<'static, str> {
+        tl!("judgement-page-label")
+    }
+
+    fn exit(&mut self) -> Result<()> {
+        if self.save_time.is_finite() {
+            save_data()?;
+        }
+        Ok(())
+    }
+
+    fn touch(&mut self, touch: &Touch, s: &mut SharedState) -> Result<bool> {
+        let t = s.t;
+        if self.reset_btn.touch(touch, t) && !get_data().config.judgement_windows.is_default() {
+            get_data_mut().config.judgement_windows = JudgementWindows::default();
+            get_data_mut().config.judgement_window_notice_pending = false;
+            self.save_time = t;
+            return Ok(true);
+        }
+        if self.input_cali_btn.touch(touch, t) {
+            self.cali_task = Some(Box::pin(OffsetPage::new()));
+            return Ok(true);
+        }
+        if self.scroll.touch(touch, t) {
+            return Ok(true);
+        }
+
+        let current = get_data().config.judgement_windows;
+        let (result, perfect) = Self::touch_slider(&mut self.perfect_slider, touch, t, current.perfect_ms);
+        if let Some(changed) = result {
+            if changed {
+                let windows = &mut get_data_mut().config.judgement_windows;
+                windows.perfect_ms = perfect;
+                windows.good_ms = windows.good_ms.max(perfect);
+                windows.bad_ms = windows.bad_ms.max(windows.good_ms);
+                self.changed(t);
+            }
+            return Ok(true);
+        }
+        let (result, good) = Self::touch_slider(&mut self.good_slider, touch, t, current.good_ms);
+        if let Some(changed) = result {
+            if changed {
+                let windows = &mut get_data_mut().config.judgement_windows;
+                windows.good_ms = good.max(windows.perfect_ms);
+                windows.bad_ms = windows.bad_ms.max(windows.good_ms);
+                self.changed(t);
+            }
+            return Ok(true);
+        }
+        let (result, bad) = Self::touch_slider(&mut self.bad_slider, touch, t, current.bad_ms);
+        if let Some(changed) = result {
+            if changed {
+                let windows = &mut get_data_mut().config.judgement_windows;
+                windows.bad_ms = bad.max(windows.good_ms);
+                self.changed(t);
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn update(&mut self, s: &mut SharedState) -> Result<()> {
+        self.scroll.update(s.t);
+        if let Some(task) = &mut self.cali_task {
+            if let Some(res) = poll_future(task.as_mut()) {
+                match res {
+                    Err(err) => show_error(err.context(tl!("load-cali-failed"))),
+                    Ok(page) => self.next_page = Some(NextPage::Overlay(Box::new(page))),
+                }
+                self.cali_task = None;
+            }
+        }
+        if s.t > self.save_time + SettingsPage::SAVE_TIME {
+            save_data()?;
+            self.save_time = f32::INFINITY;
+        }
+        Ok(())
+    }
+
+    fn render(&mut self, ui: &mut Ui, s: &mut SharedState) -> Result<()> {
+        let t = s.t;
+        s.fader.render(ui, s.t, |ui| -> Result<()> {
+            let outer = ui.content_rect().feather(-0.02);
+            let footer_h = 0.13;
+            let content = Rect::new(outer.x, outer.y, outer.w, (outer.h - footer_h - 0.02).max(0.2));
+            self.scroll.size((content.w, content.h));
+            ui.scope(|ui| {
+                ui.dx(content.x);
+                ui.dy(content.y);
+                self.scroll.render(ui, |ui| {
+                    let windows = get_data().config.judgement_windows;
+                    let custom = !windows.is_default();
+                    let w = content.w;
+                    let mut y = 0.;
+
+                    let card = Rect::new(0., y, w, 0.15);
+                    ui.fill_path(
+                        &card.rounded(0.018),
+                        if custom {
+                            Color {
+                                a: 0.8,
+                                ..Color::from_hex_rgb(0x6d4c41)
+                            }
+                        } else {
+                            semi_white(0.08)
+                        },
+                    );
+                    ui.text(if custom {
+                        tl!("judgement-custom-title")
+                    } else {
+                        tl!("judgement-original-title")
+                    })
+                    .pos(0.04, card.y + 0.045)
+                    .size(0.62)
+                    .draw_using(&BOLD_FONT);
+                    ui.text(if custom {
+                        tl!("judgement-custom-mode-sub")
+                    } else {
+                        tl!("judgement-original-mode-sub")
+                    })
+                    .pos(0.04, card.y + 0.105)
+                    .anchor(0., 0.5)
+                    .size(0.34)
+                    .color(semi_white(0.72))
+                    .draw();
+                    y += card.h + 0.035;
+
+                    let axis = Rect::new(0.08, y + 0.055, w - 0.16, 0.028);
+                    let center = axis.center().x;
+                    let half = axis.w / 2.;
+                    ui.fill_path(&axis.rounded(0.014), semi_white(0.12));
+                    for (value, color) in [
+                        (
+                            windows.bad_ms,
+                            Color {
+                                a: 0.8,
+                                ..Color::from_hex_rgb(0xef5350)
+                            },
+                        ),
+                        (
+                            windows.good_ms,
+                            Color {
+                                a: 0.87,
+                                ..Color::from_hex_rgb(0xffca28)
+                            },
+                        ),
+                        (
+                            windows.perfect_ms,
+                            Color {
+                                a: 0.93,
+                                ..Color::from_hex_rgb(0x42a5f5)
+                            },
+                        ),
+                    ] {
+                        let width = half * value as f32 / MAX_JUDGEMENT_MS as f32;
+                        if width > 0. {
+                            ui.fill_path(&Rect::new(center - width, axis.y, width * 2., axis.h).rounded(0.014), color);
+                        }
+                    }
+                    ui.text("-500ms")
+                        .pos(axis.x, axis.y - 0.012)
+                        .anchor(0., 1.)
+                        .size(0.3)
+                        .color(semi_white(0.65))
+                        .draw();
+                    ui.text("0").pos(center, axis.y - 0.012).anchor(0.5, 1.).size(0.3).draw();
+                    ui.text("+500ms")
+                        .pos(axis.right(), axis.y - 0.012)
+                        .anchor(1., 1.)
+                        .size(0.3)
+                        .color(semi_white(0.65))
+                        .draw();
+                    y += 0.13;
+
+                    let inactive = tl!("judgement-tier-inactive");
+                    let labels = [
+                        format!("Perfect  |Δ| ≤ {}ms", windows.perfect_ms),
+                        if windows.good_ms == windows.perfect_ms {
+                            format!("Good · {inactive}")
+                        } else {
+                            format!("Good  {}ms < |Δ| ≤ {}ms", windows.perfect_ms, windows.good_ms)
+                        },
+                        if windows.bad_ms == windows.good_ms {
+                            format!("Bad · {inactive}")
+                        } else {
+                            format!("Bad  {}ms < |Δ| ≤ {}ms", windows.good_ms, windows.bad_ms)
+                        },
+                    ];
+                    let rr = Rect::new(w - 0.3, 0., INTERACT_WIDTH, ITEM_HEIGHT * 2. / 3.);
+                    for (index, label) in labels.into_iter().enumerate() {
+                        ui.text(label)
+                            .pos(0.04, y + ITEM_HEIGHT / 2.)
+                            .anchor(0., 0.5)
+                            .no_baseline()
+                            .size(0.42)
+                            .draw();
+                        let row = Rect::new(rr.x, y + (ITEM_HEIGHT - rr.h) / 2., rr.w, rr.h);
+                        match index {
+                            0 => self
+                                .perfect_slider
+                                .render(ui, row, t, windows.perfect_ms as f32, format!("{}ms", windows.perfect_ms)),
+                            1 => self
+                                .good_slider
+                                .render(ui, row, t, windows.good_ms as f32, format!("{}ms", windows.good_ms)),
+                            _ => self.bad_slider.render(ui, row, t, windows.bad_ms as f32, format!("{}ms", windows.bad_ms)),
+                        }
+                        y += ITEM_HEIGHT;
+                    }
+
+                    let input_card = Rect::new(0., y + 0.02, w, 0.15);
+                    ui.fill_path(&input_card.rounded(0.018), semi_white(0.08));
+                    ui.text(tl!("judgement-input-offset"))
+                        .pos(0.04, input_card.y + 0.045)
+                        .size(0.46)
+                        .draw_using(&BOLD_FONT);
+                    ui.text(tl!("judgement-input-offset-sub"))
+                        .pos(0.04, input_card.y + 0.105)
+                        .anchor(0., 0.5)
+                        .size(0.32)
+                        .color(semi_white(0.68))
+                        .draw();
+                    self.input_cali_btn.render_text(
+                        ui,
+                        Rect::new(input_card.right() - 0.32, input_card.center().y - 0.045, 0.28, 0.09),
+                        t,
+                        format!("{:+}ms", get_data().config.input_offset_ms),
+                        0.42,
+                        true,
+                    );
+                    y = input_card.bottom() + 0.015;
+
+                    let notice = Rect::new(0., y + 0.025, w, 0.16);
+                    ui.fill_path(
+                        &notice.rounded(0.018),
+                        Color {
+                            a: 0.67,
+                            ..Color::from_hex_rgb(0x455a64)
+                        },
+                    );
+                    ui.text(tl!("judgement-local-only-notice"))
+                        .pos(0.04, notice.center().y)
+                        .anchor(0., 0.5)
+                        .size(0.38)
+                        .multiline()
+                        .max_width(notice.w - 0.08)
+                        .draw();
+                    (w, notice.bottom() + 0.03)
+                });
+            });
+
+            let reset = Rect::new(outer.right() - 0.42, outer.bottom() - footer_h, 0.42, 0.1);
+            let enabled = !get_data().config.judgement_windows.is_default();
+            if enabled {
+                self.reset_btn.render_text(ui, reset, t, tl!("judgement-reset"), 0.46, true);
+            } else {
+                self.reset_btn
+                    .render_text_color(ui, reset, t, tl!("judgement-reset"), 0.46, false, semi_white(0.35));
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn next_page(&mut self) -> NextPage {
+        self.next_page.take().unwrap_or_default()
     }
 }
 

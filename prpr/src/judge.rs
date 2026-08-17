@@ -1,7 +1,7 @@
 //! Judgement system
 
 use crate::{
-    config::Config,
+    config::{Config, JudgementWindows},
     core::{BadNote, Chart, NoteKind, Point, Resource, Vector, NOTE_WIDTH_RATIO_BASE},
     ext::{get_viewport, NotNanExt},
 };
@@ -22,6 +22,12 @@ pub const LIMIT_GOOD: f64 = 0.16;
 pub const LIMIT_BAD: f64 = 0.22;
 pub const UP_TOLERANCE: f64 = 0.05;
 pub const DIST_FACTOR: f64 = 0.2;
+
+/// Keep an unjudged note alive briefly so an event timestamped before the
+/// boundary can still arrive on the following frame. This does not widen the
+/// judgement window because candidates are checked against their event time.
+pub const INPUT_EVENT_GRACE: f64 = 0.035;
+const MAX_VALID_TOUCH_EVENT_AGE: f64 = 1.;
 
 const EARLY_OFFSET: f64 = 0.07;
 
@@ -139,16 +145,30 @@ pub enum JudgeStatus {
     NotJudged,
     PreJudge,
     Judged,
-    Hold(bool, f64, f64, bool, f64), // perfect, at, diff, pre-judge, up-time
+    Hold(Judgement, f64, f64, bool, f64), // grade, at, diff, pre-judge, up-time
 }
 
 #[repr(u8)]
-#[derive(Debug, Copy, Clone, Serialize)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize)]
 pub enum Judgement {
     Perfect,
     Good,
     Bad,
     Miss,
+}
+
+#[inline]
+fn classify_custom(windows: JudgementWindows, diff: f64) -> Option<Judgement> {
+    let diff = diff.abs();
+    if diff <= windows.perfect() {
+        Some(Judgement::Perfect)
+    } else if diff <= windows.good() {
+        Some(Judgement::Good)
+    } else if diff <= windows.bad() {
+        Some(Judgement::Bad)
+    } else {
+        None
+    }
 }
 
 #[cfg(not(closed))]
@@ -298,6 +318,20 @@ pub fn take_wheel() -> (f32, f32) {
     WHEEL.with(|it| mem::take(&mut *it.borrow_mut()))
 }
 
+#[inline]
+fn touch_event_age_at(now: f64, event_time: f64) -> Option<f64> {
+    if !event_time.is_finite() {
+        return None;
+    }
+    let age = now - event_time;
+    (age >= 0. && age <= MAX_VALID_TOUCH_EVENT_AGE).then_some(age)
+}
+
+#[inline]
+fn compensate_input_time(event_time: f64, speed: f64, input_offset: f64) -> f64 {
+    event_time - input_offset * speed
+}
+
 impl Judge {
     pub fn new(chart: &Chart) -> Self {
         let notes = chart
@@ -409,6 +443,13 @@ impl Judge {
         })
     }
 
+    /// Age of a timestamped touch event in the platform monotonic clock.
+    /// Mouse/keyboard fallback events and incompatible clock domains return
+    /// `None` and are judged at the current frame time.
+    pub fn touch_event_age(touch: &Touch) -> Option<f64> {
+        touch_event_age_at(get_uptime(), touch.time)
+    }
+
     pub fn update(&mut self, res: &mut Resource, chart: &mut Chart, bad_notes: &mut Vec<BadNote>) {
         if res.config.autoplay() {
             self.auto_play_update(res, chart);
@@ -416,6 +457,10 @@ impl Judge {
         }
         const X_DIFF_MAX: f64 = 0.21 / (16. / 9.) * 2.;
         let spd = res.config.speed as f64;
+        let windows = res.config.judgement_windows;
+        let custom_timing = !windows.is_default();
+        let limit_good = if custom_timing { windows.good() } else { LIMIT_GOOD };
+        let limit_bad = if custom_timing { windows.bad() } else { LIMIT_BAD };
 
         let uptime = get_uptime();
 
@@ -512,11 +557,7 @@ impl Judge {
         let touches: Vec<Touch> = touches
             .into_values()
             .map(|mut it| {
-                it.time = if it.time.is_infinite() {
-                    f64::NEG_INFINITY
-                } else {
-                    t - (uptime - it.time) * spd
-                };
+                it.time = touch_event_age_at(uptime, it.time).map_or(f64::NEG_INFINITY, |age| t - age * spd);
                 it
             })
             .collect();
@@ -543,11 +584,12 @@ impl Judge {
                     .collect(),
             );
         }
+        let input_offset = res.config.input_offset();
         let time_of = |touch: &Touch| {
             if touch.time.is_infinite() {
                 t
             } else {
-                touch.time
+                compensate_input_time(touch.time, spd, input_offset)
             }
         };
         let mut judgements = Vec::new();
@@ -560,7 +602,7 @@ impl Judge {
                 continue;
             }
             let t = time_of(touch);
-            let mut closest = (None, X_DIFF_MAX, LIMIT_BAD, LIMIT_BAD + (X_DIFF_MAX / NOTE_WIDTH_RATIO_BASE - 1.).max(0.) * DIST_FACTOR);
+            let mut closest = (None, X_DIFF_MAX, limit_bad, limit_bad + (X_DIFF_MAX / NOTE_WIDTH_RATIO_BASE - 1.).max(0.) * DIST_FACTOR);
             for (line_id, ((line, pos), (idx, st))) in chart.lines.iter_mut().zip(pos.iter()).zip(self.notes.iter_mut()).enumerate() {
                 let Some(pos) = pos[id] else {
                     continue;
@@ -573,11 +615,17 @@ impl Judge {
                     if !click && matches!(note.kind, NoteKind::Click | NoteKind::Hold { .. }) {
                         continue;
                     }
-                    let dt = (note.time - t) / spd;
-                    if dt >= closest.3 {
+                    let raw_dt = (note.time - t) / spd;
+                    if (custom_timing && raw_dt > limit_bad) || (!custom_timing && raw_dt >= closest.3) {
                         break;
                     }
-                    let dt = if dt < 0. { (dt + EARLY_OFFSET).min(0.).abs() } else { dt };
+                    let dt = if custom_timing {
+                        raw_dt.abs()
+                    } else if raw_dt < 0. {
+                        (raw_dt + EARLY_OFFSET).min(0.).abs()
+                    } else {
+                        raw_dt
+                    };
                     let x = &mut note.object.translation.0;
                     x.set_time(t);
                     let dist = (x.now() - pos.x).abs() as f64 / note.judge_area as f64;
@@ -585,7 +633,9 @@ impl Judge {
                         continue;
                     }
                     if dt
-                        > if matches!(note.kind, NoteKind::Click) {
+                        > if custom_timing {
+                            limit_bad
+                        } else if matches!(note.kind, NoteKind::Click) {
                             LIMIT_BAD - LIMIT_PERFECT * (dist - 0.9).max(0.)
                         } else {
                             LIMIT_GOOD
@@ -593,13 +643,17 @@ impl Judge {
                     {
                         continue;
                     }
-                    let dt = if matches!(note.kind, NoteKind::Flick | NoteKind::Drag) {
+                    let dt = if !custom_timing && matches!(note.kind, NoteKind::Flick | NoteKind::Drag) {
                         dt + LIMIT_GOOD
                     } else {
                         dt
                     };
-                    let key = dt + (dist / NOTE_WIDTH_RATIO_BASE - 1.).max(0.) * DIST_FACTOR;
-                    if key < closest.3 {
+                    let key = if custom_timing {
+                        dt + dist * f64::EPSILON
+                    } else {
+                        dt + (dist / NOTE_WIDTH_RATIO_BASE - 1.).max(0.) * DIST_FACTOR
+                    };
+                    if (custom_timing && (dt < closest.2 || (dt == closest.2 && dist < closest.1))) || (!custom_timing && key < closest.3) {
                         closest = (Some((line_id, *id)), dist, dt, key);
                     }
                 }
@@ -616,16 +670,38 @@ impl Judge {
                     if matches!(note.kind, NoteKind::Flick) {
                         continue; // to next loop
                     }
-                    if dt <= LIMIT_GOOD || matches!(note.kind, NoteKind::Hold { .. }) {
+                    if dt <= limit_good || matches!(note.kind, NoteKind::Hold { .. }) || custom_timing {
                         match note.kind {
                             NoteKind::Click => {
-                                note.judge = JudgeStatus::Judged;
-                                judgements.push((if dt <= LIMIT_PERFECT { Judgement::Perfect } else { Judgement::Good }, line_id, id, Some(t)));
+                                let grade = if custom_timing {
+                                    classify_custom(windows, dt).unwrap()
+                                } else if dt <= LIMIT_PERFECT {
+                                    Judgement::Perfect
+                                } else if dt <= LIMIT_GOOD {
+                                    Judgement::Good
+                                } else {
+                                    Judgement::Bad
+                                };
+                                note.judge = if matches!(grade, Judgement::Bad) {
+                                    JudgeStatus::PreJudge
+                                } else {
+                                    JudgeStatus::Judged
+                                };
+                                judgements.push((grade, line_id, id, Some(t)));
                             }
                             NoteKind::Hold { .. } => {
                                 note.hitsound.play(res);
-                                self.judgements.borrow_mut().push((t, line_id as _, id, Err(dt <= LIMIT_PERFECT)));
-                                note.judge = JudgeStatus::Hold(dt <= LIMIT_PERFECT, t, t, false, f64::INFINITY);
+                                let grade = if custom_timing {
+                                    classify_custom(windows, dt).unwrap()
+                                } else if dt <= LIMIT_PERFECT {
+                                    Judgement::Perfect
+                                } else {
+                                    Judgement::Good
+                                };
+                                self.judgements
+                                    .borrow_mut()
+                                    .push((t, line_id as _, id, Err(matches!(grade, Judgement::Perfect))));
+                                note.judge = JudgeStatus::Hold(grade, t, t, false, f64::INFINITY);
                             }
                             _ => unreachable!(),
                         };
@@ -647,32 +723,58 @@ impl Judge {
             }
         }
         for _ in 0..keys_down {
-            // find the earliest not judged click / hold note
-            if let Some((line_id, id)) = chart
-                .lines
-                .iter()
-                .zip(self.notes.iter())
-                .enumerate()
-                .filter_map(|(line_id, (line, (idx, st)))| {
-                    idx[*st..]
-                        .iter()
-                        .cloned()
-                        .find(|id| {
-                            let note = &line.notes[*id as usize];
-                            matches!(note.judge, JudgeStatus::NotJudged) && matches!(note.kind, NoteKind::Click | NoteKind::Hold { .. })
+            let candidate = if custom_timing {
+                chart
+                    .lines
+                    .iter()
+                    .zip(self.notes.iter())
+                    .enumerate()
+                    .flat_map(|(line_id, (line, (idx, st)))| {
+                        idx[*st..].iter().copied().filter_map(move |id| {
+                            let note = &line.notes[id as usize];
+                            (matches!(note.judge, JudgeStatus::NotJudged)
+                                && matches!(note.kind, NoteKind::Click | NoteKind::Hold { .. })
+                                && (note.time - t).abs() / spd <= limit_bad)
+                                .then_some((line_id, id))
                         })
-                        .map(|id| (line_id, id))
-                })
-                .min_by_key(|(line_id, id)| chart.lines[*line_id].notes[*id as usize].time.not_nan())
-            {
+                    })
+                    .min_by_key(|(line_id, id)| ((chart.lines[*line_id].notes[*id as usize].time - t).abs() / spd).not_nan())
+            } else {
+                // Preserve the original keyboard priority exactly.
+                chart
+                    .lines
+                    .iter()
+                    .zip(self.notes.iter())
+                    .enumerate()
+                    .filter_map(|(line_id, (line, (idx, st)))| {
+                        idx[*st..]
+                            .iter()
+                            .cloned()
+                            .find(|id| {
+                                let note = &line.notes[*id as usize];
+                                matches!(note.judge, JudgeStatus::NotJudged) && matches!(note.kind, NoteKind::Click | NoteKind::Hold { .. })
+                            })
+                            .map(|id| (line_id, id))
+                    })
+                    .min_by_key(|(line_id, id)| chart.lines[*line_id].notes[*id as usize].time.not_nan())
+            };
+            if let Some((line_id, id)) = candidate {
                 let note = &mut chart.lines[line_id].notes[id as usize];
                 let dt = (t - note.time).abs() / spd;
-                if dt <= if matches!(note.kind, NoteKind::Click) { LIMIT_BAD } else { LIMIT_GOOD } {
+                if dt
+                    <= if custom_timing || matches!(note.kind, NoteKind::Click) {
+                        limit_bad
+                    } else {
+                        LIMIT_GOOD
+                    }
+                {
                     match note.kind {
                         NoteKind::Click => {
                             note.judge = JudgeStatus::Judged;
                             judgements.push((
-                                if dt <= LIMIT_PERFECT {
+                                if custom_timing {
+                                    classify_custom(windows, dt).unwrap()
+                                } else if dt <= LIMIT_PERFECT {
                                     Judgement::Perfect
                                 } else if dt <= LIMIT_GOOD {
                                     Judgement::Good
@@ -686,8 +788,17 @@ impl Judge {
                         }
                         NoteKind::Hold { .. } => {
                             note.hitsound.play(res);
-                            self.judgements.borrow_mut().push((t, line_id as _, id, Err(dt <= LIMIT_PERFECT)));
-                            note.judge = JudgeStatus::Hold(dt <= LIMIT_PERFECT, t, t, false, f64::INFINITY);
+                            let grade = if custom_timing {
+                                classify_custom(windows, dt).unwrap()
+                            } else if dt <= LIMIT_PERFECT {
+                                Judgement::Perfect
+                            } else {
+                                Judgement::Good
+                            };
+                            self.judgements
+                                .borrow_mut()
+                                .push((t, line_id as _, id, Err(matches!(grade, Judgement::Perfect))));
+                            note.judge = JudgeStatus::Hold(grade, t, t, false, f64::INFINITY);
                         }
                         _ => unreachable!(),
                     };
@@ -731,26 +842,32 @@ impl Judge {
                 }
                 // process miss
                 let dt = (t - note.time) / spd;
-                if dt > LIMIT_BAD {
+                if dt > limit_bad + INPUT_EVENT_GRACE {
                     note.judge = JudgeStatus::Judged;
                     judgements.push((Judgement::Miss, line_id, *id, None));
                     continue;
                 }
-                if -dt > LIMIT_BAD {
+                if -dt > limit_bad {
                     break;
                 }
                 if !matches!(note.kind, NoteKind::Drag) && (self.key_down_count == 0 || !matches!(note.kind, NoteKind::Flick)) {
                     continue;
                 }
-                let dt = dt.abs();
                 let x = &mut note.object.translation.0;
                 x.set_time(t);
                 let x = x.now();
                 if self.key_down_count != 0
-                    || pos.iter().any(|it| {
+                    || pos.iter().zip(touches.iter()).any(|(it, touch)| {
                         it.is_some_and(|it| {
                             let dx = (it.x - x).abs() as f64 / note.judge_area as f64;
-                            dx <= X_DIFF_MAX && dt <= (LIMIT_BAD - LIMIT_PERFECT * (dx - 0.9).max(0.))
+                            let touch_dt = ((time_of(touch) - note.time) / spd).abs();
+                            dx <= X_DIFF_MAX
+                                && touch_dt
+                                    <= if custom_timing {
+                                        limit_bad
+                                    } else {
+                                        LIMIT_BAD - LIMIT_PERFECT * (dx - 0.9).max(0.)
+                                    }
                         })
                     })
                 {
@@ -763,17 +880,17 @@ impl Judge {
             line.object.set_time(t);
             for id in &idx[*st..] {
                 let note = &mut line.notes[*id as usize];
-                if let JudgeStatus::Hold(perfect, .., diff, true, _) = note.judge {
+                if let JudgeStatus::Hold(grade, .., diff, true, _) = note.judge {
                     if let NoteKind::Hold { end_time, .. } = &note.kind {
                         if *end_time <= t {
                             note.judge = JudgeStatus::Judged;
-                            judgements.push((if perfect { Judgement::Perfect } else { Judgement::Good }, line_id, *id, Some(diff)));
+                            judgements.push((grade, line_id, *id, Some(diff)));
                             continue;
                         }
                     }
                 }
                 // TODO adjust
-                let ghost_t = t + LIMIT_GOOD;
+                let ghost_t = t + if custom_timing { limit_bad } else { LIMIT_GOOD };
                 if matches!(note.kind, NoteKind::Click) {
                     if ghost_t < note.time {
                         break;
@@ -895,7 +1012,7 @@ impl Judge {
                 note.judge = if matches!(note.kind, NoteKind::Hold { .. }) {
                     note.hitsound.play(res);
                     self.judgements.borrow_mut().push((t, line_id as _, *id, Err(true)));
-                    JudgeStatus::Hold(true, t, (t - note.time) / spd, false, f64::INFINITY)
+                    JudgeStatus::Hold(Judgement::Perfect, t, (t - note.time) / spd, false, f64::INFINITY)
                 } else {
                     judgements.push((line_id, *id));
                     JudgeStatus::Judged
@@ -1042,5 +1159,63 @@ pub fn icon_index(score: u32, full_combo: bool) -> usize {
         (1000000, _) => 7,
         (_, false) => 5,
         (_, true) => 6,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn windows(perfect_ms: u16, good_ms: u16, bad_ms: u16) -> JudgementWindows {
+        JudgementWindows { perfect_ms, good_ms, bad_ms }
+    }
+
+    #[test]
+    fn custom_judgement_is_symmetric_and_inclusive() {
+        let w = windows(80, 160, 220);
+        assert_eq!(classify_custom(w, -0.080), Some(Judgement::Perfect));
+        assert_eq!(classify_custom(w, 0.081), Some(Judgement::Good));
+        assert_eq!(classify_custom(w, -0.160), Some(Judgement::Good));
+        assert_eq!(classify_custom(w, 0.161), Some(Judgement::Bad));
+        assert_eq!(classify_custom(w, -0.220), Some(Judgement::Bad));
+        assert_eq!(classify_custom(w, 0.221), None);
+    }
+
+    #[test]
+    fn equal_boundaries_skip_later_tiers() {
+        let no_good = windows(80, 80, 220);
+        assert_eq!(classify_custom(no_good, 0.080), Some(Judgement::Perfect));
+        assert_eq!(classify_custom(no_good, 0.081), Some(Judgement::Bad));
+
+        let no_bad = windows(80, 160, 160);
+        assert_eq!(classify_custom(no_bad, 0.160), Some(Judgement::Good));
+        assert_eq!(classify_custom(no_bad, 0.161), None);
+    }
+
+    #[test]
+    fn zero_and_max_windows_are_supported() {
+        let zero = windows(0, 0, 0);
+        assert_eq!(classify_custom(zero, 0.), Some(Judgement::Perfect));
+        assert_eq!(classify_custom(zero, f64::EPSILON), None);
+
+        let max = windows(500, 500, 500);
+        assert_eq!(classify_custom(max, -0.5), Some(Judgement::Perfect));
+        assert_eq!(classify_custom(max, 0.501), None);
+    }
+
+    #[test]
+    fn timestamp_age_rejects_fallback_and_incompatible_clocks() {
+        assert_eq!(touch_event_age_at(10., 9.975), Some(0.025));
+        assert_eq!(touch_event_age_at(10., f64::NEG_INFINITY), None);
+        assert_eq!(touch_event_age_at(10., 10.001), None);
+        assert_eq!(touch_event_age_at(10., 8.9), None);
+    }
+
+    #[test]
+    fn input_compensation_preserves_the_already_adjusted_chart_time() {
+        // `event_time` already contains the chart/audio offset applied by the
+        // game scene. Input compensation only adds its independent correction.
+        assert_eq!(compensate_input_time(12.4, 1., 0.), 12.4);
+        assert!((compensate_input_time(12.4, 2., 0.025) - 12.35).abs() < 1e-12);
     }
 }

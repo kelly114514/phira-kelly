@@ -11,7 +11,7 @@ use crate::{
         basic_client_builder, recv_raw, Chart, ChartRef, ChartRefChartInfo, Client, Collection, CollectionUpdate, Permissions, Ptr, Record, User,
         UserManager, CLIENT_TOKEN,
     },
-    data::{BriefChartInfo, LocalChart},
+    data::{BriefChartInfo, CustomRecord, LocalChart},
     dir, get_data, get_data_mut,
     icons::Icons,
     page::{
@@ -45,7 +45,7 @@ use prpr::{
     judge::{icon_index, Judge},
     scene::{
         request_file, request_input, return_file, return_input, show_error, show_message, take_file, take_input, BasicPlayer, GameMode, LoadingScene,
-        LocalSceneTask, NextScene, RecordUpdateState, SaveFn, Scene, SimpleRecord, UpdateFn, UploadFn,
+        LocalSceneTask, NextScene, PlayedRecord, RecordUpdateState, SaveFn, Scene, SimpleRecord, UpdateFn, UploadFn,
     },
     task::Task,
     time::TimeManager,
@@ -321,6 +321,7 @@ pub struct SongScene {
 
     rank_icons: [SafeTexture; 8],
     record: Option<SimpleRecord>,
+    custom_record: Option<CustomRecord>,
 
     fetch_best_task: Option<Task<Result<SimpleRecord>>>,
 
@@ -447,6 +448,12 @@ impl SongScene {
             .find(|it| Some(&it.local_path) == local_path.as_ref())
             .and_then(|it| it.record.clone())
             .or_else(|| local_path.as_ref().and_then(|path| get_data().local_records.get(path).cloned().flatten()));
+        let custom_record = get_data()
+            .charts
+            .iter()
+            .find(|it| Some(&it.local_path) == local_path.as_ref())
+            .and_then(|it| it.custom_record.clone())
+            .or_else(|| local_path.as_ref().and_then(|path| get_data().custom_local_records.get(path).cloned()));
         let fetch_best_task = if get_data().me.is_some() {
             chart.info.id.map(|id| Task::new(Client::best_record(id)))
         } else {
@@ -499,6 +506,7 @@ impl SongScene {
 
             rank_icons,
             record,
+            custom_record,
 
             fetch_best_task,
 
@@ -712,6 +720,7 @@ impl SongScene {
                             info: entity.to_info(),
                             local_path,
                             record: None,
+                            custom_record: None,
                             mods: Mods::default(),
                             played_unlock: false,
                         },
@@ -856,16 +865,33 @@ impl SongScene {
     ) -> Result<LocalSceneTask> {
         let mut fs = fs_from_path(local_path)?;
         let can_rated = id.is_some() || local_path.starts_with(':');
-        #[cfg(feature = "video")]
         let local_path = local_path.to_owned();
+        let multiplayer = client.is_some();
+        let selected_windows = get_data().config.judgement_windows;
+        let custom_scope = !multiplayer && !selected_windows.is_default();
+        let recordable = !mods.intersects(Mods::UNRATED) && get_data().config.speed >= 1.0 - 1e-3;
+        if multiplayer && !selected_windows.is_default() {
+            show_message(tl!("multiplayer-default-judgement")).warn();
+        }
+        if custom_scope && recordable && mode == GameMode::Normal && get_data().config.judgement_window_notice_pending {
+            show_message(tl!(
+                "custom-judgement-notice",
+                "perfect" => selected_windows.perfect_ms,
+                "good" => selected_windows.good_ms,
+                "bad" => selected_windows.bad_ms
+            ))
+            .warn();
+            get_data_mut().config.judgement_window_notice_pending = false;
+            save_data()?;
+        }
         #[cfg(closed)]
         let rated = {
             let config = &get_data().config;
-            !config.offline_mode && can_rated && !mods.intersects(Mods::UNRATED) && !config.use_keyboard && config.speed >= 1.0 - 1e-3
+            config.score_upload_allowed(mods, can_rated, multiplayer)
         };
         #[cfg(not(closed))]
         let rated = false;
-        if !rated && can_rated && mode == GameMode::Normal {
+        if !rated && !custom_scope && can_rated && mode == GameMode::Normal {
             show_message(tl!("warn-unrated")).warn();
         }
         let update_fn = client.and_then(|mut client| {
@@ -971,31 +997,73 @@ impl SongScene {
         });
 
         let save_fn: Option<SaveFn> = Some(Box::new({
-            let local_path = local_path.to_string();
+            let local_path = local_path.clone();
             move |new_rec| -> Result<()> {
-                let rec = get_data_mut()
-                    .charts
-                    .iter_mut()
-                    .find(|it| it.local_path == local_path)
-                    .map(|it| &mut it.record)
-                    .or_else(|| Some(get_data_mut().local_records.entry(local_path.clone()).or_insert(None)))
-                    .unwrap();
-                if let Some(rec) = rec {
-                    if rec.update(&new_rec) {
-                        save_data()?;
+                let changed = if custom_scope {
+                    let data = get_data_mut();
+                    if let Some(chart) = data.charts.iter_mut().find(|it| it.local_path == local_path) {
+                        if let Some(best) = &mut chart.custom_record {
+                            best.update(new_rec, selected_windows)
+                        } else {
+                            chart.custom_record = Some(CustomRecord {
+                                record: new_rec,
+                                judgement_windows: selected_windows,
+                            });
+                            true
+                        }
+                    } else {
+                        match data.custom_local_records.entry(local_path.clone()) {
+                            hash_map::Entry::Occupied(mut entry) => entry.get_mut().update(new_rec, selected_windows),
+                            hash_map::Entry::Vacant(entry) => {
+                                entry.insert(CustomRecord {
+                                    record: new_rec,
+                                    judgement_windows: selected_windows,
+                                });
+                                true
+                            }
+                        }
                     }
                 } else {
-                    *rec = Some(new_rec);
+                    let data = get_data_mut();
+                    let rec = if let Some(index) = data.charts.iter().position(|it| it.local_path == local_path) {
+                        &mut data.charts[index].record
+                    } else {
+                        data.local_records.entry(local_path.clone()).or_insert(None)
+                    };
+                    if let Some(rec) = rec {
+                        rec.update(&new_rec)
+                    } else {
+                        *rec = Some(new_rec);
+                        true
+                    }
+                };
+                if changed {
                     save_data()?;
                 }
                 Ok(())
             }
         }));
 
+        let custom_historic_best = if custom_scope {
+            get_data()
+                .charts
+                .iter()
+                .find(|it| it.local_path == local_path)
+                .and_then(|it| it.custom_record.as_ref())
+                .or_else(|| get_data().custom_local_records.get(&local_path))
+                .map_or(0, |it| it.record.score as u32)
+        } else {
+            0
+        };
+
         Ok(Some(Box::pin(async move {
             let mut info = fs::load_info(fs.as_mut()).await?;
             info.id = id;
             let mut config = get_data().config.clone();
+            if multiplayer {
+                config.judgement_windows = Default::default();
+                config.judgement_window_notice_pending = false;
+            }
             config.player_name = get_data()
                 .me
                 .as_ref()
@@ -1019,46 +1087,55 @@ impl SongScene {
                 avatar: UserManager::get_avatar(it.id).flatten(),
                 id: it.id,
                 rks: it.rks,
-                historic_best: record.map_or(0, |it| it.score as u32),
+                historic_best: if custom_scope {
+                    custom_historic_best
+                } else {
+                    record.as_ref().map_or(0, |it| it.score as u32)
+                },
             });
-            let upload_fn: Option<UploadFn> = Some(Arc::new(move |data: Vec<u8>| {
-                Task::new(async move {
-                    #[derive(Serialize)]
-                    #[serde(rename_all = "camelCase")]
-                    struct Req {
-                        chart: i32,
-                        token: String,
-                        chart_updated: Option<DateTime<Utc>>,
-                    }
-                    #[derive(Deserialize)]
-                    #[serde(rename_all = "camelCase")]
-                    struct Resp {
-                        id: i32,
-                        exp_delta: f64,
-                        new_best: bool,
-                        improvement: u32,
-                        new_rks: f32,
-                    }
-                    let resp: Resp = recv_raw(Client::post(
-                        "/play/upload",
-                        &Req {
-                            chart: id.unwrap(),
-                            token: STANDARD.encode(data),
-                            chart_updated,
-                        },
-                    ))
-                    .await?
-                    .json()
-                    .await?;
-                    RECORD_ID.store(resp.id, Ordering::Relaxed);
-                    Ok(RecordUpdateState {
-                        best: resp.new_best,
-                        improvement: resp.improvement,
-                        gain_exp: resp.exp_delta as f32,
-                        new_rks: Some(resp.new_rks),
+            let upload_fn: Option<UploadFn> = if custom_scope {
+                None
+            } else {
+                let upload: UploadFn = Arc::new(move |data: Vec<u8>| {
+                    Task::new(async move {
+                        #[derive(Serialize)]
+                        #[serde(rename_all = "camelCase")]
+                        struct Req {
+                            chart: i32,
+                            token: String,
+                            chart_updated: Option<DateTime<Utc>>,
+                        }
+                        #[derive(Deserialize)]
+                        #[serde(rename_all = "camelCase")]
+                        struct Resp {
+                            id: i32,
+                            exp_delta: f64,
+                            new_best: bool,
+                            improvement: u32,
+                            new_rks: f32,
+                        }
+                        let resp: Resp = recv_raw(Client::post(
+                            "/play/upload",
+                            &Req {
+                                chart: id.unwrap(),
+                                token: STANDARD.encode(data),
+                                chart_updated,
+                            },
+                        ))
+                        .await?
+                        .json()
+                        .await?;
+                        RECORD_ID.store(resp.id, Ordering::Relaxed);
+                        Ok(RecordUpdateState {
+                            best: resp.new_best,
+                            improvement: resp.improvement,
+                            gain_exp: resp.exp_delta as f32,
+                            new_rks: Some(resp.new_rks),
+                        })
                     })
-                })
-            }));
+                });
+                Some(upload)
+            };
             if is_unlock {
                 #[cfg(not(feature = "video"))]
                 {
@@ -1589,6 +1666,31 @@ impl SongScene {
 
 impl Scene for SongScene {
     fn on_result(&mut self, tm: &mut TimeManager, res: Box<dyn Any>) -> Result<()> {
+        let res = match res.downcast::<PlayedRecord>() {
+            Err(res) => res,
+            Ok(played) => {
+                self.fade_start = tm.now() as f32 + fade_in_time().unwrap_or_default();
+                if self.my_rate_score == Some(0) && thread_rng().gen_ratio(2, 5) {
+                    self.rate_dialog.enter(tm.real_time() as _);
+                }
+                if let Some(windows) = played.judgement_windows {
+                    if let Some(best) = &mut self.custom_record {
+                        best.update(played.record, windows);
+                    } else {
+                        self.custom_record = Some(CustomRecord {
+                            record: played.record,
+                            judgement_windows: windows,
+                        });
+                    }
+                } else if let Some(record) = &mut self.record {
+                    record.update(&played.record);
+                } else {
+                    self.record = Some(played.record);
+                }
+                self.load_ldb();
+                return Ok(());
+            }
+        };
         let res = match res.downcast::<SimpleRecord>() {
             Err(res) => res,
             Ok(rec) => {
@@ -2665,12 +2767,19 @@ impl Scene for SongScene {
                 .draw();
 
             // bottom bar
+            let active_windows = get_data().config.judgement_windows;
+            let custom_active = !active_windows.is_default();
+            let shown_record = if custom_active {
+                self.custom_record.as_ref().map(|it| &it.record)
+            } else {
+                self.record.as_ref()
+            };
             let s = 0.25;
             let r = Rect::new(-0.94, ui.top - s - 0.06, s, s);
-            let icon = self.record.as_ref().map_or(0, |it| icon_index(it.score as _, it.full_combo));
+            let icon = shown_record.map_or(0, |it| icon_index(it.score as _, it.full_combo));
             ui.fill_rect(r, (*self.rank_icons[icon], r, ScaleType::Fit));
-            let score = self.record.as_ref().map(|it| it.score).unwrap_or_default();
-            let accuracy = self.record.as_ref().map(|it| it.accuracy).unwrap_or_default();
+            let score = shown_record.map(|it| it.score).unwrap_or_default();
+            let accuracy = shown_record.map(|it| it.accuracy).unwrap_or_default();
             let r = ui
                 .text(format!("{score:07}"))
                 .pos(r.right() + 0.01, r.center().y)
@@ -2684,11 +2793,40 @@ impl Scene for SongScene {
                 .color(semi_white(0.7))
                 .draw();
 
+            if custom_active {
+                let source = self.custom_record.as_ref().map(|it| it.judgement_windows);
+                let text = source.map_or_else(
+                    || tl!("custom-best-empty").into_owned(),
+                    |it| {
+                        tl!(
+                            "custom-best-source",
+                            "perfect" => it.perfect_ms,
+                            "good" => it.good_ms,
+                            "bad" => it.bad_ms
+                        )
+                    },
+                );
+                ui.text(text)
+                    .pos(r.x, r.y - 0.025)
+                    .anchor(0., 1.)
+                    .size(0.36)
+                    .color(Color::from_hex_rgb(0xffb74d))
+                    .draw_using(&BOLD_FONT);
+            }
+
             if self.info.id.is_some() {
                 let h = 0.09;
                 let mut r = Rect::new(r.x, r.y - h, h, h);
                 ui.fill_rect(r, (*self.icons.ldb, r, ScaleType::Fit));
-                if let Some((rank, _)) = &self.ldb {
+                if custom_active {
+                    ui.text(tl!("custom-local-rank"))
+                        .pos(r.right() + 0.01, r.center().y)
+                        .anchor(0., 0.5)
+                        .no_baseline()
+                        .size(0.48)
+                        .color(Color::from_hex_rgb(0xffb74d))
+                        .draw();
+                } else if let Some((rank, _)) = &self.ldb {
                     ui.text(if let Some(rank) = rank {
                         format!("#{rank}")
                     } else {
@@ -2720,6 +2858,20 @@ impl Scene for SongScene {
             let w = 0.26;
             let pad = 0.08;
             let r = Rect::new(1. - pad - w, ui.top - pad - w, w, w);
+            if custom_active {
+                let chip = tl!(
+                    "custom-active-chip",
+                    "perfect" => active_windows.perfect_ms,
+                    "good" => active_windows.good_ms,
+                    "bad" => active_windows.bad_ms
+                );
+                ui.text(chip)
+                    .pos(r.center().x, r.y - 0.025)
+                    .anchor(0.5, 1.)
+                    .size(0.35)
+                    .color(Color::from_hex_rgb(0xffb74d))
+                    .draw_using(&BOLD_FONT);
+            }
             self.play_btn.render_shadow(ui, r, t, |ui, path| {
                 ui.fill_path(&path, semi_white(0.3));
                 let r = r.feather(-0.04);

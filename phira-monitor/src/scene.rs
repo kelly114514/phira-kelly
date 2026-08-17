@@ -205,7 +205,17 @@ impl PlayerView {
                     }
                 }
                 Err(perfect) => {
-                    note.judge = JudgeStatus::Hold(perfect, t, 0., false, f64::INFINITY);
+                    note.judge = JudgeStatus::Hold(
+                        if perfect {
+                            prpr::judge::Judgement::Perfect
+                        } else {
+                            prpr::judge::Judgement::Good
+                        },
+                        t,
+                        0.,
+                        false,
+                        f64::INFINITY,
+                    );
                 }
             }
         }

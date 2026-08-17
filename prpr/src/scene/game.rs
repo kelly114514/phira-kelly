@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     bin::BinaryReader,
-    config::{Config, Mods},
+    config::{Config, JudgementWindows, Mods},
     core::{copy_fbo, BadNote, Chart, ChartExtra, Effect, Point, Resource, UIElement, Vector, PGR_FONT},
     ext::{parse_time, screen_aspect, semi_white, RectExt, SafeTexture, ScaleType},
     fs::FileSystem,
@@ -60,7 +60,21 @@ pub struct SimpleRecord {
     pub full_combo: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct PlayedRecord {
+    pub record: SimpleRecord,
+    pub judgement_windows: Option<JudgementWindows>,
+}
+
 impl SimpleRecord {
+    pub fn is_better_lexicographic(&self, other: &SimpleRecord) -> bool {
+        self.score
+            .cmp(&other.score)
+            .then_with(|| self.accuracy.total_cmp(&other.accuracy))
+            .then_with(|| self.full_combo.cmp(&other.full_combo))
+            .is_gt()
+    }
+
     pub fn update(&mut self, other: &SimpleRecord) -> bool {
         let mut changed = false;
         if other.score > self.score {
@@ -947,11 +961,7 @@ impl Scene for GameScene {
                     // TODO strengthen the protection
                     #[cfg(closed)]
                     if let Some(upload_fn) = &self.upload_fn {
-                        if !self.res.config.offline_mode
-                            && !self.res.config.mods.intersects(Mods::UNRATED)
-                            && !self.res.config.use_keyboard
-                            && self.res.config.speed >= 1.0 - 1e-3
-                        {
+                        if self.res.config.score_upload_allowed(self.res.config.mods, true, false) {
                             if let Some(player) = &self.player {
                                 if let Some(chart) = &self.res.info.id {
                                     record_data = Some(encode_record(self, player.id, *chart));
@@ -977,7 +987,13 @@ impl Scene for GameScene {
                                     f(new_rec.clone())?;
                                 }
                                 if let Some(best) = &mut self.best_record {
-                                    best.update(new_rec);
+                                    if !self.res.config.judgement_windows.is_default() {
+                                        if new_rec.is_better_lexicographic(best) {
+                                            *best = new_rec.clone();
+                                        }
+                                    } else {
+                                        best.update(new_rec);
+                                    }
                                 } else {
                                     self.best_record = record.clone();
                                 }
@@ -1266,7 +1282,10 @@ impl Scene for GameScene {
                 // return result to update score and refresh
                 GameMode::Normal => {
                     if let Some(rec) = &self.best_record {
-                        NextScene::PopWithResult(Box::new(rec.clone()))
+                        NextScene::PopWithResult(Box::new(PlayedRecord {
+                            record: rec.clone(),
+                            judgement_windows: (!self.res.config.judgement_windows.is_default()).then_some(self.res.config.judgement_windows),
+                        }))
                     } else {
                         NextScene::Pop
                     }
