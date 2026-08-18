@@ -49,7 +49,7 @@ use tracing::{error, info};
 #[cfg(target_os = "android")]
 use jni::{
     objects::{JClass, JString},
-    sys::jint,
+    sys::{jboolean, jint},
     EnvUnowned,
 };
 
@@ -361,7 +361,10 @@ pub extern "C" fn Java_quad_1native_QuadNative_prprActivityOnResume(_env: EnvUno
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "C" fn Java_quad_1native_QuadNative_prprActivityOnDestroy(_env: EnvUnowned, _class: JClass) {
-    std::process::exit(0);
+    // Android may destroy and recreate an Activity for configuration or memory
+    // reasons. Dropping the pause channel lets the scene loop unwind without
+    // terminating the entire application process.
+    *MESSAGES_TX.lock().unwrap() = None;
 }
 
 #[cfg(target_os = "android")]
@@ -387,24 +390,31 @@ pub extern "C" fn Java_quad_1native_QuadNative_setDpi(_env: EnvUnowned, _class: 
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "C" fn Java_quad_1native_QuadNative_setChosenFile(_env: EnvUnowned, _class: JClass, file: JString) {
-    use prpr::scene::CHOSEN_FILE;
-    CHOSEN_FILE.lock().unwrap().1 = Some(file.to_string());
+    use prpr::scene::{cleanup_chosen_file, mark_chosen_file_temporary, CHOSEN_FILE};
+    let file = file.to_string();
+    mark_chosen_file_temporary(file.clone());
+    let previous = CHOSEN_FILE.lock().unwrap().1.replace(file);
+    if let Some(previous) = previous {
+        cleanup_chosen_file(&previous);
+    }
 }
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "C" fn Java_quad_1native_QuadNative_markImport(_env: EnvUnowned, _class: JClass) {
-    use prpr::scene::CHOSEN_FILE;
+pub extern "C" fn Java_quad_1native_QuadNative_setExternalImport(_env: EnvUnowned, _class: JClass, file: JString, resource_pack: jboolean) {
+    use prpr::scene::{cleanup_chosen_file, mark_chosen_file_temporary, CHOSEN_FILE};
 
-    CHOSEN_FILE.lock().unwrap().0 = Some("_import".to_owned());
-}
-
-#[cfg(target_os = "android")]
-#[no_mangle]
-pub extern "C" fn Java_quad_1native_QuadNative_markImportRespack(_env: EnvUnowned, _class: JClass) {
-    use prpr::scene::CHOSEN_FILE;
-
-    CHOSEN_FILE.lock().unwrap().0 = Some("_import_respack".to_owned());
+    let file = file.to_string();
+    mark_chosen_file_temporary(file.clone());
+    let previous = {
+        let mut chosen = CHOSEN_FILE.lock().unwrap();
+        let previous = chosen.1.replace(file);
+        chosen.0 = Some(if resource_pack { "_import_respack" } else { "_import" }.to_owned());
+        previous
+    };
+    if let Some(previous) = previous {
+        cleanup_chosen_file(&previous);
+    }
 }
 
 #[cfg(target_os = "android")]

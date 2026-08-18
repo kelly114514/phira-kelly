@@ -44,8 +44,8 @@ use prpr::{
     info::ChartInfo,
     judge::{icon_index, Judge},
     scene::{
-        request_file, request_input, return_file, return_input, show_error, show_message, take_file, take_input, BasicPlayer, GameMode, LoadingScene,
-        LocalSceneTask, NextScene, PlayedRecord, RecordUpdateState, SaveFn, Scene, SimpleRecord, UpdateFn, UploadFn,
+        request_file, request_input, return_file, return_input, show_error, show_message, take_file, take_input, BasicPlayer, ChosenFileCleanup,
+        GameMode, LoadingScene, LocalSceneTask, NextScene, PlayedRecord, RecordUpdateState, SaveFn, Scene, SimpleRecord, UpdateFn, UploadFn,
     },
     task::Task,
     time::TimeManager,
@@ -83,6 +83,7 @@ type LocalTuple = (String, ChartInfo, AudioClip, Illustration);
 static CONFIRM_CKSUM: AtomicBool = AtomicBool::new(false);
 static UPLOAD_NOT_SAVED: AtomicBool = AtomicBool::new(false);
 static CONFIRM_OVERWRITE: AtomicBool = AtomicBool::new(false);
+static CANCEL_OVERWRITE: AtomicBool = AtomicBool::new(false);
 static CONFIRM_UPLOAD: AtomicBool = AtomicBool::new(false);
 static CONFIRM_AUTOCOMPLETE: AtomicBool = AtomicBool::new(false);
 static SKIP_AUTOCOMPLETE: AtomicBool = AtomicBool::new(false);
@@ -396,7 +397,7 @@ pub struct SongScene {
     open_web_btn: DRectButton,
 
     // Imported chart for overwriting
-    overwrite_from: Option<String>,
+    overwrite_from: Option<(String, ChosenFileCleanup)>,
     overwrite_task: Option<Task<Result<LocalTuple>>>,
 
     update_cksum_passed: Option<bool>,
@@ -2577,13 +2578,17 @@ impl Scene for SongScene {
         }
         if let Some((id, file)) = take_file() {
             if id == "overwrite" {
-                self.overwrite_from = Some(file);
+                let cleanup = ChosenFileCleanup::new(&file);
+                self.overwrite_from = Some((file, cleanup));
                 CONFIRM_OVERWRITE.store(false, Ordering::SeqCst);
+                CANCEL_OVERWRITE.store(false, Ordering::SeqCst);
                 Dialog::simple(tl!("edit-overwrite-confirm"))
                     .buttons(vec![ttl!("cancel").into_owned(), ttl!("confirm").into_owned()])
                     .listener(move |_dialog, pos| {
                         if pos == 1 {
                             CONFIRM_OVERWRITE.store(true, Ordering::SeqCst);
+                        } else {
+                            CANCEL_OVERWRITE.store(true, Ordering::SeqCst);
                         }
                         false
                     })
@@ -2592,13 +2597,17 @@ impl Scene for SongScene {
                 return_file(id, file);
             }
         }
+        if CANCEL_OVERWRITE.fetch_and(false, Ordering::Relaxed) {
+            self.overwrite_from = None;
+        }
         if CONFIRM_OVERWRITE.fetch_and(false, Ordering::Relaxed) {
-            let path = self.overwrite_from.take().unwrap();
+            let (path, cleanup) = self.overwrite_from.take().unwrap();
             let local_path = self.local_path.clone().unwrap();
             let def_illu = self.illu.texture.1.clone();
             let chart_id = self.info.id.unwrap();
             let owner = self.info.uploader.as_ref().unwrap().id;
             self.overwrite_task = Some(Task::new(async move {
+                let _cleanup = cleanup;
                 let (dir, id) = gen_custom_dir()?;
                 let to_path = format!("{}/{}/", dir::charts()?, local_path);
                 let file = File::open(path).context("cannot open file")?;

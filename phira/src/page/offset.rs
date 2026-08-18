@@ -9,7 +9,7 @@ use macroquad::prelude::*;
 use prpr::{
     config::{MAX_INPUT_OFFSET_MS, MIN_INPUT_OFFSET_MS},
     core::{ParticleEmitter, ResourcePack, NOTE_WIDTH_RATIO_BASE},
-    ext::{create_audio_manger, semi_black, RectExt, SafeTexture, ScaleType},
+    ext::{create_audio_manger, semi_black, semi_white, RectExt, SafeTexture, ScaleType},
     judge::Judge,
     time::TimeManager,
     ui::{DRectButton, Slider, Ui},
@@ -132,7 +132,7 @@ fn median(values: &[f64]) -> Option<f64> {
     let mut values = values.to_vec();
     values.sort_by(|a, b| a.total_cmp(b));
     let mid = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
+    Some(if values.len().is_multiple_of(2) {
         (values[mid - 1] + values[mid]) / 2.
     } else {
         values[mid]
@@ -189,9 +189,7 @@ impl Page for OffsetPage {
         }
         let mut input_offset = config.input_offset_ms as f32;
         if self.input_slider.touch(touch, t, &mut input_offset).is_some() {
-            config.input_offset_ms = input_offset
-                .round()
-                .clamp(MIN_INPUT_OFFSET_MS as f32, MAX_INPUT_OFFSET_MS as f32) as i16;
+            config.input_offset_ms = input_offset.round().clamp(MIN_INPUT_OFFSET_MS as f32, MAX_INPUT_OFFSET_MS as f32) as i16;
             return Ok(true);
         }
         if self.clear_btn.touch(touch, t) {
@@ -203,9 +201,7 @@ impl Page for OffsetPage {
             if self.input_samples.len() >= Self::MIN_INPUT_SAMPLES {
                 if let Some((center, mad)) = self.sample_stats() {
                     if mad <= Self::STABLE_MAD {
-                        config.input_offset_ms = (center * 1000.)
-                            .round()
-                            .clamp(MIN_INPUT_OFFSET_MS as f64, MAX_INPUT_OFFSET_MS as f64) as i16;
+                        config.input_offset_ms = (center * 1000.).round().clamp(MIN_INPUT_OFFSET_MS as f64, MAX_INPUT_OFFSET_MS as f64) as i16;
                     }
                 }
             }
@@ -295,19 +291,11 @@ impl Page for OffsetPage {
             }
 
             let offset = config.offset * 1000.;
-            ui.text(tl!("audio-offset"))
-                .pos(0.46, -0.22)
-                .size(0.42)
-                .color(semi_white(0.8))
-                .draw();
+            ui.text(tl!("audio-offset")).pos(0.46, -0.22).size(0.42).color(semi_white(0.8)).draw();
             self.slider
                 .render(ui, Rect::new(0.46, -0.16, 0.45, 0.16), ot, offset, format!("{offset:.0}ms"));
 
-            ui.text(tl!("input-offset"))
-                .pos(0.46, 0.08)
-                .size(0.42)
-                .color(semi_white(0.8))
-                .draw();
+            ui.text(tl!("input-offset")).pos(0.46, 0.08).size(0.42).color(semi_white(0.8)).draw();
             self.input_slider.render(
                 ui,
                 Rect::new(0.46, 0.14, 0.45, 0.16),
@@ -376,6 +364,6 @@ mod tests {
         let samples = [0.020, 0.021, 0.019, 0.022, 0.300];
         let (center, mad) = calibration_stats(&samples).unwrap();
         assert!((center - 0.021).abs() < 1e-9);
-        assert!((mad - 0.002).abs() < 1e-9);
+        assert!((mad - 0.001).abs() < 1e-9);
     }
 }

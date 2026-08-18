@@ -5,7 +5,7 @@ use crate::{
     core::BOLD_FONT,
     ext::{open_url, parse_time},
     info::ChartInfo,
-    scene::show_message,
+    scene::{cleanup_chosen_file, retain_chosen_file, show_message},
     ui::InputParams,
 };
 use anyhow::Result;
@@ -13,7 +13,6 @@ use inputbox::InputMode;
 use macroquad::math::Rect;
 use std::{borrow::Cow, collections::HashMap};
 
-#[derive(Clone)]
 pub struct ChartInfoEdit {
     pub info: ChartInfo,
     pub chart: Option<String>,
@@ -59,6 +58,31 @@ impl ChartInfoEdit {
             }
         }
         Ok(res)
+    }
+}
+
+impl Clone for ChartInfoEdit {
+    fn clone(&self) -> Self {
+        for path in [&self.chart, &self.music, &self.illustration, &self.unlock_video].into_iter().flatten() {
+            retain_chosen_file(path);
+        }
+        Self {
+            info: self.info.clone(),
+            chart: self.chart.clone(),
+            music: self.music.clone(),
+            illustration: self.illustration.clone(),
+            unlock_video: self.unlock_video.clone(),
+            enable_unlock: self.enable_unlock,
+            updated: self.updated,
+        }
+    }
+}
+
+impl Drop for ChartInfoEdit {
+    fn drop(&mut self) {
+        for path in [&self.chart, &self.music, &self.illustration, &self.unlock_video].into_iter().flatten() {
+            cleanup_chosen_file(path);
+        }
     }
 }
 
@@ -244,8 +268,14 @@ pub fn render_chart_info(ui: &mut Ui, edit: &mut ChartInfoEdit, width: f32) -> (
                 if edit.enable_unlock {
                     info.unlock_video = None;
                     edit.enable_unlock = false;
+                    if let Some(path) = edit.unlock_video.take() {
+                        cleanup_chosen_file(&path);
+                    }
                 } else {
                     info.unlock_video = Some("unlock.mp4".to_string());
+                    if let Some(path) = edit.unlock_video.take() {
+                        cleanup_chosen_file(&path);
+                    }
                     edit.unlock_video = Some("unlock.mp4".to_string());
                     edit.enable_unlock = true;
                 }
@@ -270,21 +300,31 @@ pub fn render_chart_info(ui: &mut Ui, edit: &mut ChartInfoEdit, width: f32) -> (
             if let Some((id, file)) = take_file() {
                 match id.as_str() {
                     "chart" => {
-                        edit.chart = Some(file);
+                        if let Some(path) = edit.chart.replace(file) {
+                            cleanup_chosen_file(&path);
+                        }
                         edit.updated = true;
                     }
                     "music" => {
-                        edit.music = Some(file);
+                        if let Some(path) = edit.music.replace(file) {
+                            cleanup_chosen_file(&path);
+                        }
                         edit.updated = true;
                     }
                     "illustration" => {
-                        edit.illustration = Some(file);
+                        if let Some(path) = edit.illustration.replace(file) {
+                            cleanup_chosen_file(&path);
+                        }
                         edit.updated = true;
                     }
                     "unlock" => {
                         if edit.enable_unlock {
-                            edit.unlock_video = Some(file);
+                            if let Some(path) = edit.unlock_video.replace(file) {
+                                cleanup_chosen_file(&path);
+                            }
                             edit.updated = true;
+                        } else {
+                            cleanup_chosen_file(&file);
                         }
                     }
                     _ => return_file(id, file),

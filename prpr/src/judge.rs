@@ -23,10 +23,12 @@ pub const LIMIT_BAD: f64 = 0.22;
 pub const UP_TOLERANCE: f64 = 0.05;
 pub const DIST_FACTOR: f64 = 0.2;
 
-/// Keep an unjudged note alive briefly so an event timestamped before the
-/// boundary can still arrive on the following frame. This does not widen the
-/// judgement window because candidates are checked against their event time.
+/// Keep an unjudged note alive briefly on platforms that provide monotonic
+/// touch timestamps, so an in-window event can arrive on the following frame.
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "windows", target_env = "ohos"))]
 pub const INPUT_EVENT_GRACE: f64 = 0.035;
+#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "windows", target_env = "ohos")))]
+pub const INPUT_EVENT_GRACE: f64 = 0.;
 const MAX_VALID_TOUCH_EVENT_AGE: f64 = 1.;
 
 const EARLY_OFFSET: f64 = 0.07;
@@ -143,7 +145,9 @@ impl FlickTracker {
 #[derive(Debug)]
 pub enum JudgeStatus {
     NotJudged,
-    PreJudge,
+    /// A delayed judgement. `Some` carries the grade and source event time for
+    /// drag/flick notes; `None` is a click Bad that was already committed.
+    PreJudge(Option<(Judgement, f64)>),
     Judged,
     Hold(Judgement, f64, f64, bool, f64), // grade, at, diff, pre-judge, up-time
 }
@@ -324,7 +328,7 @@ fn touch_event_age_at(now: f64, event_time: f64) -> Option<f64> {
         return None;
     }
     let age = now - event_time;
-    (age >= 0. && age <= MAX_VALID_TOUCH_EVENT_AGE).then_some(age)
+    (0. ..=MAX_VALID_TOUCH_EVENT_AGE).contains(&age).then_some(age)
 }
 
 #[inline]
@@ -609,7 +613,7 @@ impl Judge {
                 };
                 for id in &idx[*st..] {
                     let note = &mut line.notes[*id as usize];
-                    if !matches!(note.judge, JudgeStatus::NotJudged | JudgeStatus::PreJudge) {
+                    if !matches!(note.judge, JudgeStatus::NotJudged | JudgeStatus::PreJudge(_)) {
                         continue;
                     }
                     if !click && matches!(note.kind, NoteKind::Click | NoteKind::Hold { .. }) {
@@ -618,6 +622,12 @@ impl Judge {
                     let raw_dt = (note.time - t) / spd;
                     if (custom_timing && raw_dt > limit_bad) || (!custom_timing && raw_dt >= closest.3) {
                         break;
+                    }
+                    // The grace period exists only for delayed timestamped
+                    // events. A mouse/fallback event still uses the original
+                    // late boundary.
+                    if touch.time.is_infinite() && raw_dt < -limit_bad {
+                        continue;
                     }
                     let dt = if custom_timing {
                         raw_dt.abs()
@@ -683,7 +693,7 @@ impl Judge {
                                     Judgement::Bad
                                 };
                                 note.judge = if matches!(grade, Judgement::Bad) {
-                                    JudgeStatus::PreJudge
+                                    JudgeStatus::PreJudge(None)
                                 } else {
                                     JudgeStatus::Judged
                                 };
@@ -709,13 +719,18 @@ impl Judge {
                         // prevent extra judgements
                         if matches!(note.judge, JudgeStatus::NotJudged) {
                             // keep the note after bad judgement
-                            line.notes[id as usize].judge = JudgeStatus::PreJudge;
+                            line.notes[id as usize].judge = JudgeStatus::PreJudge(None);
                             judgements.push((Judgement::Bad, line_id, id, None));
                         }
                     }
                 } else {
                     // flick
-                    line.notes[id as usize].judge = JudgeStatus::PreJudge;
+                    let grade = if custom_timing {
+                        classify_custom(windows, dt).unwrap()
+                    } else {
+                        Judgement::Perfect
+                    };
+                    line.notes[id as usize].judge = JudgeStatus::PreJudge(Some((grade, t)));
                     if let Some(tracker) = self.trackers.get_mut(&touch.id) {
                         tracker.flicked = false;
                     }
@@ -856,22 +871,43 @@ impl Judge {
                 let x = &mut note.object.translation.0;
                 x.set_time(t);
                 let x = x.now();
-                if self.key_down_count != 0
-                    || pos.iter().zip(touches.iter()).any(|(it, touch)| {
-                        it.is_some_and(|it| {
+                let keyboard_candidate = (self.key_down_count != 0 && dt.abs() <= limit_bad).then(|| {
+                    let grade = if custom_timing {
+                        classify_custom(windows, dt).unwrap()
+                    } else {
+                        Judgement::Perfect
+                    };
+                    (grade, t)
+                });
+                let touch_candidate = pos
+                    .iter()
+                    .zip(touches.iter())
+                    .filter_map(|(it, touch)| {
+                        it.and_then(|it| {
                             let dx = (it.x - x).abs() as f64 / note.judge_area as f64;
-                            let touch_dt = ((time_of(touch) - note.time) / spd).abs();
-                            dx <= X_DIFF_MAX
-                                && touch_dt
+                            let event_time = time_of(touch);
+                            let touch_dt = (event_time - note.time) / spd;
+                            let accepted = dx <= X_DIFF_MAX
+                                && touch_dt.abs()
                                     <= if custom_timing {
                                         limit_bad
                                     } else {
                                         LIMIT_BAD - LIMIT_PERFECT * (dx - 0.9).max(0.)
-                                    }
+                                    };
+                            accepted.then(|| {
+                                let grade = if custom_timing {
+                                    classify_custom(windows, touch_dt).unwrap()
+                                } else {
+                                    Judgement::Perfect
+                                };
+                                (grade, event_time, touch_dt.abs())
+                            })
                         })
                     })
-                {
-                    note.judge = JudgeStatus::PreJudge;
+                    .min_by_key(|(_, _, diff)| diff.not_nan())
+                    .map(|(grade, event_time, _)| (grade, event_time));
+                if let Some(pending) = keyboard_candidate.or(touch_candidate) {
+                    note.judge = JudgeStatus::PreJudge(Some(pending));
                 }
             }
         }
@@ -898,15 +934,12 @@ impl Judge {
                 } else if t < note.time {
                     continue;
                 }
-                if matches!(note.judge, JudgeStatus::PreJudge) {
-                    let diff = if let JudgeStatus::Hold(.., diff, _, _) = note.judge {
-                        Some(diff)
-                    } else {
-                        None
-                    };
+                if let JudgeStatus::PreJudge(pending) = &note.judge {
+                    let pending = *pending;
                     note.judge = JudgeStatus::Judged;
                     if !matches!(note.kind, NoteKind::Click) {
-                        judgements.push((Judgement::Perfect, line_id, *id, diff));
+                        let (grade, event_time) = pending.unwrap_or((Judgement::Perfect, note.time));
+                        judgements.push((grade, line_id, *id, Some(event_time)));
                     }
                 }
             }
@@ -926,7 +959,7 @@ impl Judge {
                 id,
                 if matches!(judgement, Judgement::Miss) {
                     0.25
-                } else if matches!(note.kind, NoteKind::Drag | NoteKind::Flick) {
+                } else if !custom_timing && matches!(note.kind, NoteKind::Drag | NoteKind::Flick) {
                     0.
                 } else {
                     (diff.unwrap_or(t) - note.time) / spd
@@ -1205,7 +1238,7 @@ mod tests {
 
     #[test]
     fn timestamp_age_rejects_fallback_and_incompatible_clocks() {
-        assert_eq!(touch_event_age_at(10., 9.975), Some(0.025));
+        assert!((touch_event_age_at(10., 9.975).unwrap() - 0.025).abs() < 1e-12);
         assert_eq!(touch_event_age_at(10., f64::NEG_INFINITY), None);
         assert_eq!(touch_event_age_at(10., 10.001), None);
         assert_eq!(touch_event_age_at(10., 8.9), None);

@@ -19,7 +19,7 @@ use prpr::scene::{request_input, return_input, take_input};
 use prpr::{
     ext::{open_url, semi_black, semi_white, RectExt, SafeTexture, ScaleType, BLACK_TEXTURE},
     judge::icon_index,
-    scene::{request_file, return_file, show_error, show_message, take_file, NextScene, Scene},
+    scene::{request_file, return_file, show_error, show_message, take_file, ChosenFileCleanup, NextScene, Scene},
     task::Task,
     time::TimeManager,
     ui::{button_hit, rounded_rect_shadow, DRectButton, Dialog, RectButton, Scroll, ShadowConfig, Ui},
@@ -203,7 +203,8 @@ impl Scene for ProfileScene {
         if let Some((id, file)) = take_file() {
             if id == "avatar" {
                 self.avatar_task = Some(Task::new(async move {
-                    let id = Client::upload_file("avatar", std::fs::read(file)?).await?;
+                    let _cleanup = ChosenFileCleanup::new(&file);
+                    let id = Client::upload_file("avatar", std::fs::read(&file)?).await?;
                     recv_raw(Client::post("/edit/avatar", &json!({ "file": id }))).await?;
                     Ok(())
                 }));

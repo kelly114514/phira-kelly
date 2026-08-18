@@ -16,7 +16,7 @@ use prpr::{
     ext::{unzip_into, RectExt, SafeTexture, ScaleType},
     info::ChartInfo,
     parse::ParseWarnings,
-    scene::{return_file, show_error, show_message, take_file, NextScene, Scene},
+    scene::{return_file, show_error, show_message, take_file, ChosenFileCleanup, NextScene, Scene},
     task::Task,
     time::TimeManager,
     ui::{button_hit, Dialog, FontArc, RectButton, Ui, UI_AUDIO},
@@ -75,7 +75,7 @@ pub struct MainScene {
 
     // batch import
     batch_import_confirm: Arc<AtomicBool>,
-    batch_import: Option<(String, ExportInfo)>,
+    batch_import: Option<(String, ExportInfo, ChosenFileCleanup)>,
     batch_import_task: Option<Task<Result<()>>>,
     batch_import_rx: Option<mpsc::Receiver<ImportChart>>,
     batch_imported_charts: Vec<ImportChart>,
@@ -402,22 +402,26 @@ impl Scene for MainScene {
                     })();
                     match export_info {
                         Err(err) => {
+                            let _cleanup = ChosenFileCleanup::new(&file);
                             show_error(err.context(itl!("import-failed")));
                         }
                         Ok(None) => {
                             self.import_task = Some(Task::new(async move {
+                                let _cleanup = ChosenFileCleanup::new(&file);
                                 let file = File::open(&file).context("cannot open file")?;
                                 import_chart(file).await
                             }));
                         }
                         Ok(Some((info, count))) => {
-                            self.batch_import = Some((file, info));
+                            let cleanup = ChosenFileCleanup::new(&file);
+                            self.batch_import = Some((file, info, cleanup));
                             self.batch_import_total = count;
                             confirm_dialog(itl!("batch-import"), itl!("batch-import-confirm", "count" => count), self.batch_import_confirm.clone());
                         }
                     };
                 }
                 "_import_respack" => {
+                    let _cleanup = ChosenFileCleanup::new(&file);
                     let root = dir::respacks()?;
                     let dir = prpr::dir::Dir::new(&root)?;
                     let mut dir_id: Option<String> = None;
@@ -491,11 +495,12 @@ impl Scene for MainScene {
             }
         }
         if self.batch_import_confirm.swap(false, Ordering::Relaxed) {
-            if let Some((file, _info)) = self.batch_import.take() {
+            if let Some((file, _info, cleanup)) = self.batch_import.take() {
                 let (tx, rx) = mpsc::channel();
                 self.batch_import_rx = Some(rx);
                 self.batch_imported_charts.clear();
                 self.batch_import_task = Some(Task::new(async move {
+                    let _cleanup = cleanup;
                     let mut archive = zip::ZipArchive::new(BufReader::new(File::open(&file)?))?;
                     let charts_dir = dir::charts()?;
                     for i in 0..archive.len() {

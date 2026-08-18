@@ -2422,7 +2422,6 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 [[package]]
 name = "miniquad"
 version = "0.3.15"
-source = "git+https://github.com/Mivik/prpr-miniquad?rev=138679c#138679cab57d84637bbada4d7eef54da34c2871a"
 dependencies = [
  "hms-opengtx-binding",
  "jni 0.21.1",

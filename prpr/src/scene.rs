@@ -31,6 +31,8 @@ use std::{
     cell::RefCell,
     sync::{Arc, Mutex},
 };
+#[cfg(not(target_arch = "wasm32"))]
+use std::{collections::HashMap, sync::LazyLock};
 use tracing::warn;
 
 #[derive(Default)]
@@ -155,6 +157,70 @@ pub static INPUT_TEXT: Mutex<(Option<String>, Option<String>)> = Mutex::new((Non
 pub static INPUT_CANCELLED: Mutex<Option<String>> = Mutex::new(None);
 #[cfg(not(target_arch = "wasm32"))]
 pub static CHOSEN_FILE: Mutex<(Option<String>, Option<String>)> = Mutex::new((None, None));
+#[cfg(not(target_arch = "wasm32"))]
+static TEMP_CHOSEN_FILES: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Marks a native file-picker result as an app-owned temporary file.
+pub fn mark_chosen_file_temporary(path: String) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut files = TEMP_CHOSEN_FILES.lock().unwrap();
+        files.entry(path).or_insert(1);
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = path;
+}
+
+/// Adds a second owner for an app-owned chosen file.
+pub fn retain_chosen_file(path: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(owners) = TEMP_CHOSEN_FILES.lock().unwrap().get_mut(path) {
+        *owners += 1;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = path;
+}
+
+/// Removes a chosen file only when the native bridge marked it as app-owned.
+pub fn cleanup_chosen_file(path: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let owned = {
+            let mut files = TEMP_CHOSEN_FILES.lock().unwrap();
+            match files.get_mut(path) {
+                Some(owners) if *owners > 1 => {
+                    *owners -= 1;
+                    false
+                }
+                Some(_) => {
+                    files.remove(path);
+                    true
+                }
+                None => false,
+            }
+        };
+        if owned {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = path;
+}
+
+#[must_use = "keep this guard alive while the chosen file is still in use"]
+pub struct ChosenFileCleanup(String);
+
+impl ChosenFileCleanup {
+    pub fn new(path: &str) -> Self {
+        Self(path.to_owned())
+    }
+}
+
+impl Drop for ChosenFileCleanup {
+    fn drop(&mut self) {
+        cleanup_chosen_file(&self.0);
+    }
+}
 
 fn show_inputbox(config: InputBox, backend: &dyn Backend) {
     let result = config.show_with_async(backend, |result| match result {
@@ -585,3 +651,29 @@ fn draw_background(tex: Texture2D) {
 }
 
 pub type LocalSceneTask = LocalTask<Result<NextScene>>;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chosen_file_cleanup_only_removes_owned_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = dir.path().join("owned.bin");
+        let external = dir.path().join("external.bin");
+        std::fs::write(&owned, b"owned").unwrap();
+        std::fs::write(&external, b"external").unwrap();
+
+        let owned = owned.to_string_lossy().into_owned();
+        mark_chosen_file_temporary(owned.clone());
+        retain_chosen_file(&owned);
+        drop(ChosenFileCleanup::new(&owned));
+        assert!(std::fs::exists(&owned).unwrap());
+        drop(ChosenFileCleanup::new(&owned));
+        assert!(!std::fs::exists(&owned).unwrap());
+
+        let external = external.to_string_lossy().into_owned();
+        drop(ChosenFileCleanup::new(&external));
+        assert!(std::fs::exists(&external).unwrap());
+    }
+}
